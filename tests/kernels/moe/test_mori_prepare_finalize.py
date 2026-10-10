@@ -126,3 +126,82 @@ def test_mori_combine_uses_original_per_rank_topk_ids(monkeypatch):
         "instead of this rank's pre-dispatch routing, which silently corrupts "
         "the reduction (ROCm/mori#475)"
     )
+
+
+class _FakeMoriV2Op:
+    def __init__(self):
+        self.routing = object()
+        self.dispatch_indices = None
+        self.combine_routing = None
+
+    def dispatch(self, a1, weights, scale, indices, *, return_routing=False):
+        assert return_routing
+        assert weights.dtype == torch.float32
+        self.dispatch_indices = indices
+        # MoRI EPv2 forwards scales as int32 rows padded past scale_dim.
+        padded = torch.zeros(scale.shape[0], 4, dtype=torch.float32)
+        padded[:, : scale.shape[1]] = scale
+        recv_token_num = torch.tensor([a1.shape[0]])
+        return (
+            a1,
+            weights,
+            padded.view(torch.int32),
+            indices,
+            recv_token_num,
+            self.routing,
+        )
+
+    def combine(self, fused_expert_output, weights, indices, *, routing):
+        self.combine_routing = routing
+        return (fused_expert_output, None)
+
+
+def test_mori_v2_routes_padding_locally_and_combines_with_routing(monkeypatch):
+    _import_mori_prepare_finalize(monkeypatch)
+    module_name = "vllm.model_executor.layers.fused_moe.prepare_finalize.mori_v2"
+    sys.modules.pop(module_name, None)
+    mori_v2_module = importlib.import_module(module_name)
+    mori_op = _FakeMoriV2Op()
+    adapter = mori_v2_module.MoriV2PrepareAndFinalize(
+        mori_op=mori_op,
+        max_tokens_per_rank=16,
+        num_dispatchers=2,
+        rank_expert_offset=4,
+        num_local_experts=4,
+        use_fp8_dispatch=True,
+        scale_dim=2,
+    )
+    scale = torch.randn(2, 2)
+    adapter._quantize_dispatch_input = lambda a1, *_: (a1, scale)
+
+    hidden_states = torch.randn(2, 4)
+    # The second token is padding: vLLM marks it with expert id -1.
+    topk_ids = torch.tensor([[0, 5], [-1, -1]], dtype=torch.int32)
+    dispatch_a1, dispatch_scale, _, dispatch_ids, dispatch_weights = adapter.prepare(
+        hidden_states,
+        torch.ones(2, 2, dtype=torch.bfloat16),
+        topk_ids,
+        num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        quant_config=SimpleNamespace(),
+    )
+    torch.testing.assert_close(dispatch_scale, scale, atol=0, rtol=0)
+    torch.testing.assert_close(
+        mori_op.dispatch_indices,
+        torch.tensor([[0, 5], [4, 5]], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+
+    output = torch.empty_like(hidden_states)
+    adapter.finalize(
+        output,
+        dispatch_a1,
+        dispatch_weights,
+        dispatch_ids,
+        apply_router_weight_on_input=False,
+        weight_and_reduce_impl=SimpleNamespace(),
+    )
+    assert mori_op.combine_routing is mori_op.routing
+    torch.testing.assert_close(output, hidden_states, atol=0, rtol=0)

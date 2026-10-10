@@ -1079,7 +1079,12 @@ class FusedMoEParallelConfig:
         return self.use_all2all_kernels and self.all2all_backend in (
             "mori_high_throughput",
             "mori_low_latency",
+            "mori_v2",
         )
+
+    @property
+    def use_mori_v2_kernels(self):
+        return self.use_all2all_kernels and self.all2all_backend == "mori_v2"
 
     @property
     def use_nixl_ep_kernels(self):
@@ -1544,6 +1549,10 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+    @property
+    def use_mori_v2_kernels(self):
+        return self.moe_parallel_config.use_mori_v2_kernels
 
     @property
     def use_fi_nvl_two_sided_kernels(self):

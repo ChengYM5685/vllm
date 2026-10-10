@@ -26,6 +26,7 @@ from vllm.utils.import_utils import (
     has_deep_ep,
     has_deep_ep_v2,
     has_mori,
+    has_mori_v2,
 )
 
 from .base_device_communicator import All2AllManagerBase, Cache
@@ -1096,6 +1097,132 @@ class MoriAll2AllManager(All2AllManagerBase):
             mori_kwargs, self._make_handle
         )
         return handle
+
+
+def _mori_v2_arena_bytes(cfg) -> int:
+    """Upper bound of the MoRI EPv2 gather-mode symmetric arena for `cfg`."""
+    # The hip backend pads scale rows to 128 B; flydsl uses the unpadded row.
+    scale_row = -(-cfg.scale_dim * cfg.scale_type_size // 128) * 128
+    topk = cfg.num_experts_per_token
+    per_recv_row = cfg.token_nbytes + cfg.combine_token_nbytes + scale_row
+    per_recv_row += topk * 8 + 4
+    # The arena aligns each of its (at most 12) regions to 256 B.
+    return cfg.effective_max_recv * per_recv_row + cfg.world_size * 12 + 12 * 256
+
+
+@contextmanager
+def _mori_without_rdma() -> Iterator[None]:
+    """Keep MoRI from opening RDMA NICs while a single-node cco communicator is
+    created.
+
+    The intranode EPv2 kernels only use peer (XGMI) pointers, but cco registers
+    every window as an RDMA memory region whenever a NIC is present, and ionic
+    rejects regions above 2 GiB (the arena at 16k tokens per rank). An include
+    list naming no device leaves the communicator without an RDMA context.
+    A user-set MORI_RDMA_DEVICES is left alone.
+    """
+    if "MORI_RDMA_DEVICES" in os.environ:
+        yield
+        return
+    os.environ["MORI_RDMA_DEVICES"] = "none"
+    try:
+        yield
+    finally:
+        os.environ.pop("MORI_RDMA_DEVICES", None)
+
+
+class MoriV2All2AllManager(All2AllManagerBase):
+    """MoRI EPv2 (`mori.ops.dispatch_combine_v2`) over cco symmetric memory.
+
+    Each op config gets its own cco communicator, whose window holds that op's
+    arena. Single node only.
+    """
+
+    # cco reserves this much virtual address space per rank at minimum.
+    _MIN_PER_RANK_VMM = 4 << 30
+
+    def __init__(self, cpu_group):
+        assert has_mori_v2(), (
+            "MoRI with EPv2 (mori.ops.dispatch_combine_v2) not found. Please "
+            "follow https://github.com/ROCm/mori/blob/main/README.md to install "
+            "MoRI >= v1.2.3.post1."
+        )
+        super().__init__(cpu_group)
+        if self.internode:
+            raise NotImplementedError("mori_v2 all2all backend is single node only")
+        self.handle_cache = Cache()
+
+    def _make_all2all_kwargs(
+        self,
+        num_ep_ranks: int,
+        token_hidden_size: int,
+        max_num_tokens_per_dp_rank: int,
+        num_local_experts: int,
+        num_experts_per_token: int,
+        dispatch_dtype: torch.dtype,
+        scale_dim: int,
+        scale_type_size: int,
+    ):
+        # An fp8 dispatch is asymmetric: fp8 on the wire, bf16 combine.
+        asymmetric = dispatch_dtype != torch.bfloat16
+        return dict(
+            rank=self.rank,
+            world_size=num_ep_ranks,
+            hidden_dim=token_hidden_size,
+            max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=num_experts_per_token,
+            data_type=torch.bfloat16,
+            dispatch_data_type=dispatch_dtype if asymmetric else None,
+            combine_data_type=torch.bfloat16 if asymmetric else None,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            combine_mode="gather",
+            quant_type="none",
+        )
+
+    def _make_handle(self, **kwargs):
+        from mori.cco import Communicator  # type: ignore[import-not-found]
+        from mori.ops.dispatch_combine_v2 import (  # type: ignore[import-not-found]
+            EpDispatchCombineConfig,
+            EpDispatchCombineOp,
+        )
+
+        cfg = EpDispatchCombineConfig(**kwargs)
+        uid = [Communicator.get_unique_id() if self.rank == 0 else None]
+        dist.broadcast_object_list(
+            uid, src=dist.get_global_rank(self.cpu_group, 0), group=self.cpu_group
+        )
+        arena_bytes = _mori_v2_arena_bytes(cfg)
+        # Logged up front: a NIC that cannot register the arena as one memory
+        # region fails inside MoRI without a Python traceback.
+        logger.info(
+            "Creating MoRI EPv2 op: recv_cap=%d arena=%.2f GiB",
+            cfg.effective_max_recv,
+            arena_bytes / (1 << 30),
+        )
+        per_rank_vmm = max(self._MIN_PER_RANK_VMM, arena_bytes)
+        with _mori_without_rdma():
+            comm = Communicator.init(
+                self.world_size, self.rank, uid[0], per_rank_vmm=per_rank_vmm
+            )
+            # The op keeps the communicator alive; destroy() tears both down.
+            handle = EpDispatchCombineOp(cfg, comm)
+        comm.barrier()
+        logger.info("MoRI EPv2 op ready: backend=%s", handle.backend_name)
+        return handle
+
+    def get_handle(self, kwargs):
+        mori_kwargs = self._make_all2all_kwargs(**kwargs)
+        logger.debug("MoRI EPv2 all2all args %s", mori_kwargs)
+        return self.handle_cache.get_or_create(mori_kwargs, self._make_handle)
+
+    def destroy(self):
+        with self.handle_cache._lock:
+            for handle in list(self.handle_cache._cache.values()):
+                handle.close()
+                handle.comm.destroy()
+            self.handle_cache._cache.clear()
 
 
 class DeepEPV2All2AllManager(All2AllManagerBase):

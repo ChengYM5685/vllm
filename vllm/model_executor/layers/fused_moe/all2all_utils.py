@@ -40,6 +40,7 @@ from vllm.utils.import_utils import (
     has_deep_ep_v2,
     has_moonep,
     has_mori,
+    has_mori_v2,
     has_nixl_ep,
 )
 
@@ -111,6 +112,8 @@ if current_platform.is_cuda_alike():
         from .prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize
     if has_mori():
         from .prepare_finalize.mori import MoriPrepareAndFinalize
+    if has_mori_v2():
+        from .prepare_finalize.mori_v2 import MoriV2PrepareAndFinalize
     if has_nixl_ep():
         from .prepare_finalize.nixl_ep import (
             NIXL_EP_QUANT_BLOCK_SHAPE,
@@ -351,6 +354,30 @@ def maybe_make_prepare_finalize(
             # dispatch raw BF16/FP16 data, no scales needed.
             quant_dtype = moe.in_dtype
             scale_dim = 0
+        if moe.use_mori_v2_kernels:
+            assert moe.in_dtype == torch.bfloat16, "mori_v2 dispatches bf16 tokens"
+            num_local_experts = moe.num_experts // all2all_manager.world_size
+            handle = all2all_manager.get_handle(
+                dict(
+                    num_ep_ranks=all2all_manager.world_size,
+                    token_hidden_size=moe.hidden_dim,
+                    max_num_tokens_per_dp_rank=moe.max_num_tokens,
+                    num_local_experts=num_local_experts,
+                    num_experts_per_token=moe.experts_per_token,
+                    dispatch_dtype=quant_dtype,
+                    scale_dim=scale_dim,
+                    scale_type_size=0 if scale_dim == 0 else torch.float32.itemsize,
+                )
+            )
+            return MoriV2PrepareAndFinalize(
+                handle,
+                max_tokens_per_rank=moe.max_num_tokens,
+                num_dispatchers=all2all_manager.world_size,
+                rank_expert_offset=all2all_manager.rank * num_local_experts,
+                num_local_experts=num_local_experts,
+                use_fp8_dispatch=use_fp8_dispatch,
+                scale_dim=scale_dim,
+            )
         all_to_all_args = dict(
             rank=all2all_manager.rank,
             num_ep_ranks=all2all_manager.world_size,

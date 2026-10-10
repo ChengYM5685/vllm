@@ -25,7 +25,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import has_mori
+from vllm.utils.import_utils import has_mori, has_mori_v2
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -46,6 +46,8 @@ def _mori_worker(pgi, vllm_config, cpu_group, m, n, k, fp8, graph):
     from vllm.model_executor.layers.fused_moe.prepare_finalize.mori import (
         MoriPrepareAndFinalize,
     )
+
+    backend = vllm_config.parallel_config.all2all_backend
 
     rocm_aiter_ops.refresh_env_variables()
     init_workspace_manager(pgi.device)
@@ -69,7 +71,7 @@ def _mori_worker(pgi, vllm_config, cpu_group, m, n, k, fp8, graph):
         ep_size=2,
         ep_rank=pgi.rank,
         use_ep=True,
-        all2all_backend="mori_high_throughput",
+        all2all_backend=backend,
     )
     config = replace(
         make_dummy_moe_config(
@@ -92,6 +94,12 @@ def _mori_worker(pgi, vllm_config, cpu_group, m, n, k, fp8, graph):
     )
     prepare = maybe_make_prepare_finalize(config, quant)
     assert isinstance(prepare, MoriPrepareAndFinalize)
+    if backend == "mori_v2":
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.mori_v2 import (
+            MoriV2PrepareAndFinalize,
+        )
+
+        assert isinstance(prepare, MoriV2PrepareAndFinalize)
     assert prepare.use_fp8_dispatch == fp8
     assert prepare.num_dispatchers() == 2
     experts = AiterExperts(config, quant)
@@ -178,13 +186,20 @@ def _mori_worker(pgi, vllm_config, cpu_group, m, n, k, fp8, graph):
 )
 @pytest.mark.parametrize("m,n,k", MNKS)
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8_token_channel"])
+@pytest.mark.parametrize("backend", ["mori_high_throughput", "mori_v2"])
 @multi_gpu_test(num_gpus=2)
-def test_mori_moe(m, n, k, fp8):
+def test_mori_moe(m, n, k, fp8, backend):
+    if backend == "mori_v2" and not has_mori_v2():
+        pytest.skip("Requires MoRI with dispatch_combine_v2")
+    if backend == "mori_v2" and (m, k) == (1, 256):
+        # Reproduces without vLLM: the MoRI v1.2.3.post1 flydsl backend faults on
+        # a single 256-wide token; the hip backend passes.
+        pytest.skip("MoRI EPv2 flydsl faults on one token with hidden_dim=256")
     config = VllmConfig(
         parallel_config=ParallelConfig(
             data_parallel_size=2,
             enable_expert_parallel=True,
-            all2all_backend="mori_high_throughput",
+            all2all_backend=backend,
         ),
         scheduler_config=SchedulerConfig.default_factory(max_num_batched_tokens=256),
     )

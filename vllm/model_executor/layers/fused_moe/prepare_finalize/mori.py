@@ -48,6 +48,35 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def supports_async(self) -> bool:
         return False
 
+    def _quantize_dispatch_input(
+        self,
+        a1: torch.Tensor,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        scale = None
+        # When defer_input_quant is True, the expert kernel handles
+        # quantization internally, so skip FP8 dispatch quantization.
+        if self.use_fp8_dispatch and not defer_input_quant:
+            from aiter import QuantType, get_hip_quant
+
+            if quant_config.is_block_quantized:
+                quant_func = get_hip_quant(QuantType.per_1x128)
+                a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
+            elif quant_config.is_per_act_token:
+                quant_func = get_hip_quant(QuantType.per_Token)
+                a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
+            elif quant_config.is_per_tensor:
+                quant_func = get_hip_quant(QuantType.per_Tensor)
+                a1, scale = quant_func(
+                    a1,
+                    scale=quant_config.a1_scale,
+                    quant_dtype=current_platform.fp8_dtype(),
+                )
+                # mori expects one scale slot per token; broadcast.
+                scale = scale.expand(a1.shape[0], 1).contiguous()
+        return a1, scale
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -71,27 +100,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert not apply_router_weight_on_input, (
             "mori does not support apply_router_weight_on_input=True now."
         )
-        scale = None
-        # When defer_input_quant is True, the expert kernel handles
-        # quantization internally, so skip FP8 dispatch quantization.
-        if self.use_fp8_dispatch and not defer_input_quant:
-            from aiter import QuantType, get_hip_quant
-
-            if quant_config.is_block_quantized:
-                quant_func = get_hip_quant(QuantType.per_1x128)
-                a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
-            elif quant_config.is_per_act_token:
-                quant_func = get_hip_quant(QuantType.per_Token)
-                a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
-            elif quant_config.is_per_tensor:
-                quant_func = get_hip_quant(QuantType.per_Tensor)
-                a1, scale = quant_func(
-                    a1,
-                    scale=quant_config.a1_scale,
-                    quant_dtype=current_platform.fp8_dtype(),
-                )
-                # mori expects one scale slot per token; broadcast.
-                scale = scale.expand(a1.shape[0], 1).contiguous()
+        a1, scale = self._quantize_dispatch_input(a1, quant_config, defer_input_quant)
 
         # mori's combine() reduces over this rank's own [num_tokens, topk]
         # routing. The modular kernel rebinds topk_ids to the dispatched ids

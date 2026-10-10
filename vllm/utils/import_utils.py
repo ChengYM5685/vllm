@@ -626,6 +626,11 @@ def has_mori() -> bool:
     return _has_module("mori")
 
 
+def has_mori_v2() -> bool:
+    """Whether the optional `mori` package ships the EPv2 dispatch/combine op."""
+    return has_mori() and _has_module("mori.ops.dispatch_combine_v2")
+
+
 def has_fbgemm_gpu() -> bool:
     """Whether the optional `fbgemm_gpu` package is available."""
     return _has_module("fbgemm_gpu")

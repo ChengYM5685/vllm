@@ -49,6 +49,7 @@ All2AllBackend = Literal[
     "deepep_v2",
     "mori_high_throughput",
     "mori_low_latency",
+    "mori_v2",
     "moonep",
     "nixl_ep",
     "allgather_reducescatter",
@@ -219,6 +220,7 @@ class ParallelConfig:
     - "deepep_low_latency": Use deepep low-latency kernels
     - "mori_high_throughput": MoRI EP with InterNodeV1 for multi-node
     - "mori_low_latency": MoRI EP with InterNodeV1LL for multi-node
+    - "mori_v2": MoRI EPv2 (cco symmetric memory), single node only
     - "moonep": MoonEP balanced EP with dynamic redundant experts (NVLink)
     - "nixl_ep": Use nixl-ep kernels
     - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels
@@ -759,6 +761,7 @@ class ParallelConfig:
                 "passthrough",
                 "mori_high_throughput",
                 "mori_low_latency",
+                "mori_v2",
                 "nixl_ep",
             )
             and self.enable_expert_parallel
