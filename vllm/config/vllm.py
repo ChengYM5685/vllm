@@ -2232,6 +2232,10 @@ class VllmConfig:
                     # reduce-scatter on the comm stream under DBO.
                     "allgather_reducescatter",
                 ]
+                # MoRI EPv2 gives each microbatch its own op and dispatches /
+                # combines on the comm stream; EPv1 has no DBO support.
+                if self.parallel_config.mori_ep_v2:
+                    supported_backends.append("mori")
             else:
                 # CUDA and other platforms.
                 supported_backends = [

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -13,6 +15,12 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.v1.worker.ubatching import (
+    dbo_current_ubatch_id,
+    dbo_enabled,
+    dbo_switch_to_compute_sync,
+    dbo_yield_and_switch_from_compute_to_comm,
+)
 
 logger = init_logger(__name__)
 
@@ -21,23 +29,37 @@ _RECV_ROW_ALIGN = 32
 
 
 class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
+    """Prepare/finalize over MORI EPv2 ops, one per DBO microbatch.
+
+    Under dual batch overlap both microbatches have a dispatch or combine in
+    flight at once, and an op's receive and staging buffers are only valid
+    until its next call, so each microbatch dispatches and combines through its
+    own op (`mori_ops[dbo_current_ubatch_id()]`).
+    """
+
     def __init__(
         self,
-        mori_op: Any,
+        mori_ops: Sequence[Any],
         max_tokens_per_rank: int,
         num_dispatchers: int,
         num_local_experts: int,
         rank_expert_offset: int,
     ):
         super().__init__()
-        self.mori_op = mori_op
+        self.mori_ops = list(mori_ops)
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.num_local_experts = num_local_experts
         self.rank_expert_offset = rank_expert_offset
         self._padding_expert_ids: torch.Tensor | None = None
-        self._routing = None
+        # The routing each microbatch's dispatch returned, for its combine.
+        self._routings: list[Any] = [None] * len(self.mori_ops)
         self._experts_read_recv_rows_only = False
+
+    @property
+    def mori_op(self) -> Any:
+        """The op of the calling DBO microbatch (the only op without DBO)."""
+        return self.mori_ops[dbo_current_ubatch_id()]
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -112,6 +134,31 @@ class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def supports_async(self) -> bool:
         return False
 
+    def supports_dbo(self) -> bool:
+        # prepare()/finalize() hand dispatch and combine to the comm stream
+        # themselves (see _comm_region), each microbatch on its own op.
+        # supports_async() stays False: it also selects MK-internal
+        # shared-expert overlap.
+        return len(self.mori_ops) > 1
+
+    @contextmanager
+    def _comm_region(self) -> Iterator[None]:
+        """Scope a dispatch or combine runs in.
+
+        Without DBO it runs on the calling stream. Under DBO it runs on the comm
+        stream after yielding to the peer microbatch, so the peer's compute
+        overlaps it; the compute stream waits for it on exit. Graph capture
+        keeps it on the capture stream, as the naive DP/EP path does.
+        """
+        if not dbo_enabled() or torch.cuda.is_current_stream_capturing():
+            yield
+            return
+        dbo_yield_and_switch_from_compute_to_comm()
+        try:
+            yield
+        finally:
+            dbo_switch_to_compute_sync()
+
     def _route_padding_locally(self, topk_ids: torch.Tensor) -> torch.Tensor:
         # DP padding tokens carry expert id -1 (VLLM_MOE_SKIP_PADDING) and zero
         # weight. MORI EPv2 has no invalid-expert slot and its FlyDSL dispatch
@@ -178,20 +225,21 @@ class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if a1.dtype != torch.bfloat16:
             raise ValueError(f"MORI EPv2 requires BF16 dispatch input, got {a1.dtype}")
 
-        (
-            dispatch_a1,
-            dispatch_weights,
-            dispatch_scale,
-            dispatch_ids,
-            dispatch_recv_token_num,
-            self._routing,
-        ) = self.mori_op.dispatch(
-            a1,
-            topk_weights.to(torch.float32),
-            None,
-            self._route_padding_locally(topk_ids.to(torch.int32)),
-            return_routing=True,
-        )
+        ubatch_id = dbo_current_ubatch_id()
+        mori_op = self.mori_ops[ubatch_id]
+        dispatch_weights = topk_weights.to(torch.float32)
+        dispatch_ids = self._route_padding_locally(topk_ids.to(torch.int32))
+        with self._comm_region():
+            (
+                dispatch_a1,
+                dispatch_weights,
+                dispatch_scale,
+                dispatch_ids,
+                dispatch_recv_token_num,
+                self._routings[ubatch_id],
+            ) = mori_op.dispatch(
+                a1, dispatch_weights, None, dispatch_ids, return_routing=True
+            )
         rows = self._recv_rows_bound(a1, dispatch_a1.shape[0])
         if rows < dispatch_a1.shape[0]:
             dispatch_a1 = dispatch_a1[:rows]
@@ -235,10 +283,15 @@ class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> None:
         del topk_weights, topk_ids, apply_router_weight_on_input
         del weight_and_reduce_impl
-        if self._routing is None:
+        ubatch_id = dbo_current_ubatch_id()
+        routing = self._routings[ubatch_id]
+        if routing is None:
             raise RuntimeError("MORI EPv2 combine called without a dispatch")
         # combine takes its token mapping from the routing, not from indices.
-        result = self.mori_op.combine(fused_expert_output, routing=self._routing)[0]
+        with self._comm_region():
+            result = self.mori_ops[ubatch_id].combine(
+                fused_expert_output, routing=routing
+            )[0]
         output.copy_(result[: output.shape[0]])
         if not torch.cuda.is_current_stream_capturing():
-            self._routing = None
+            self._routings[ubatch_id] = None
