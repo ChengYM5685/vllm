@@ -350,8 +350,14 @@ def maybe_make_prepare_finalize(
             num_experts_per_rank=num_local_experts,
             num_experts_per_token=moe.experts_per_token,
         )
-        # Under DBO each microbatch dispatches through its own op.
         parallel_config = get_current_vllm_config().parallel_config
+        async_ll = parallel_config.mori_epv2_async_ll
+        if async_ll:
+            # Only MORI's hip backend has the AsyncLL kernels.
+            all_to_all_args.update(
+                async_ll=True, async_ll_transport="sdma", kernel_backend="hip"
+            )
+        # Under DBO each microbatch dispatches through its own op.
         from vllm.v1.worker.ubatch_utils import get_num_ubatches
 
         num_ops = get_num_ubatches(parallel_config)
@@ -365,6 +371,7 @@ def maybe_make_prepare_finalize(
             num_dispatchers=all2all_manager.world_size,
             num_local_experts=num_local_experts,
             rank_expert_offset=all2all_manager.rank * num_local_experts,
+            async_ll=async_ll,
         )
 
     elif moe.use_mori_epv1_kernels:

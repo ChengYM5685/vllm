@@ -665,6 +665,22 @@ def mori_epv2_unavailable_reason() -> str | None:
     return None
 
 
+@cache
+def mori_epv2_has_async_ll() -> bool:
+    """Whether the installed MoRI runs EPv2 on AsyncLL kernels (ROCm/mori#768)."""
+    if mori_epv2_unavailable_reason() is not None:
+        return False
+    from mori.ops.dispatch_combine_v2 import (  # type: ignore[import-not-found]
+        EpDispatchCombineConfig,
+    )
+
+    fields = getattr(EpDispatchCombineConfig, "__dataclass_fields__", {})
+    # The arena sizing takes AsyncLL's region table from this module.
+    return "async_ll" in fields and _has_module(
+        "mori.ops.dispatch_combine_v2.internode_regions"
+    )
+
+
 def has_fbgemm_gpu() -> bool:
     """Whether the optional `fbgemm_gpu` package is available."""
     return _has_module("fbgemm_gpu")
