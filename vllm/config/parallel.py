@@ -249,6 +249,10 @@ class ParallelConfig:
     """Whether the "mori" all2all backend runs MoRI EPv2. Resolved from
     `VLLM_MORI_EP_V2` and the deployment by `resolve_mori_all2all`; not meant
     to be set by users."""
+    mori_epv2_async_ll: bool = False
+    """Whether MoRI EPv2 runs its AsyncLL kernels, moving tokens with SDMA.
+    Resolved from `MORI_ENABLE_SDMA` by `resolve_mori_all2all`; not meant to
+    be set by users."""
 
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
@@ -1306,8 +1310,9 @@ def resolve_mori_all2all(
     is unsupported, an explicit true keeps EPv2 regardless, and false selects
     EPv1. `lsa_spans_hosts` says whether a CCO-LSA team can span hosts (e.g.
     gfx1250's UALink vPOD). `sdma_picks_epv1` says whether `MORI_ENABLE_SDMA=1`
-    selects EPv1; gfx1250 keeps EPv2 under SDMA. `validated_arch` says whether
-    EPv2 is validated on this GPU.
+    asks for SDMA transfers: EPv2's AsyncLL kernels where MoRI has them, EPv1
+    otherwise; gfx1250 keeps native EPv2 under SDMA. `validated_arch` says
+    whether EPv2 is validated on this GPU.
     """
     if parallel_config.all2all_backend != "mori":
         return
@@ -1320,7 +1325,23 @@ def resolve_mori_all2all(
             sdma_picks_epv1,
             validated_arch,
         )
-    logger.info_once("MoRI all2all: EP%s", "v2" if parallel_config.mori_ep_v2 else "v1")
+    from vllm.utils.import_utils import mori_epv2_has_async_ll
+
+    parallel_config.mori_epv2_async_ll = bool(
+        parallel_config.mori_ep_v2
+        and sdma_picks_epv1
+        and _mori_sdma_enabled()
+        and mori_epv2_has_async_ll()
+    )
+    logger.info_once(
+        "MoRI all2all: EP%s%s",
+        "v2" if parallel_config.mori_ep_v2 else "v1",
+        " AsyncLL over SDMA" if parallel_config.mori_epv2_async_ll else "",
+    )
+
+
+def _mori_sdma_enabled() -> bool:
+    return os.environ.get("MORI_ENABLE_SDMA", "0").lower() in ("1", "true")
 
 
 def _resolve_mori_ep_v2(
@@ -1382,7 +1403,10 @@ def _mori_epv2_unsupported_reason(
     sdma_picks_epv1: bool,
     validated_arch: bool,
 ) -> str | None:
-    from vllm.utils.import_utils import mori_epv2_unavailable_reason
+    from vllm.utils.import_utils import (
+        mori_epv2_has_async_ll,
+        mori_epv2_unavailable_reason,
+    )
 
     reason = mori_epv2_unavailable_reason()
     if reason is not None:
@@ -1398,9 +1422,10 @@ def _mori_epv2_unsupported_reason(
     # CCO-LSA team.
     if not lsa_spans_hosts and _ep_spans_hosts(parallel_config, ep_size):
         return f"ep_size={ep_size} across hosts (EPv2 needs one host)"
-    sdma = os.environ.get("MORI_ENABLE_SDMA", "0").lower() in ("1", "true")
-    if sdma and sdma_picks_epv1:
-        return "MORI_ENABLE_SDMA=1 (SDMA is EPv1-only)"
+    if sdma_picks_epv1 and _mori_sdma_enabled() and not mori_epv2_has_async_ll():
+        return (
+            "MORI_ENABLE_SDMA=1 (this MoRI has no EPv2 AsyncLL to move tokens by SDMA)"
+        )
     if moe_backend == "aiter_mega_moe":
         return "moe_backend=aiter_mega_moe (MegaMoE runs on MoRI EPv1 shmem)"
     if model_config is not None and model_config.dtype != torch.bfloat16:
