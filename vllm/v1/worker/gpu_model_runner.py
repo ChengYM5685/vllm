@@ -220,7 +220,7 @@ from vllm.v1.worker.utils import (
     EncoderTimingStats,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import lock_workspace, size_workspace_ubatches_alike
 
 from .utils import (
     AttentionGroup,
@@ -6122,6 +6122,10 @@ class GPUModelRunner(
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True, randomize_inputs=randomize_inputs
         )
+        if self.parallel_config.use_ubatching:
+            # The profile run does not microbatch, so it sized only microbatch
+            # 0's workspace; size the others alike before capture locks them.
+            size_workspace_ubatches_alike()
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)

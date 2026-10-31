@@ -129,6 +129,32 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def size_ubatches_alike(self) -> None:
+        """Grow each lane's microbatch slots to the largest slot of that lane.
+
+        Call it outside DBO, before any slot is captured into a CUDA graph. A run
+        that does not microbatch, such as the memory profile, sizes only
+        microbatch 0's slots, but a microbatch can need as much scratch as the
+        whole batch (e.g. an expert all-to-all that receives every rank's
+        tokens). Without this, its slot would grow mid-forward, which syncs the
+        device under DBO and fails once the workspace is locked.
+        """
+        assert not self._locked, "Cannot resize a locked workspace."
+        for lane in range(self._num_lanes):
+            ids = range(lane, len(self._current_workspaces), self._num_lanes)
+            size = max(
+                self._workspace_size_bytes(self._current_workspaces[i]) for i in ids
+            )
+            for i in ids:
+                if self._workspace_size_bytes(self._current_workspaces[i]) < size:
+                    self._current_workspaces[i] = None
+                    self._retained[i] = None
+                    torch.accelerator.empty_cache()
+                    with self._alloc_context():
+                        self._current_workspaces[i] = torch.empty(
+                            (size,), dtype=torch.uint8, device=self._device
+                        )
+
     def _get_workspace_id(self) -> int:
         lane = _workspace_lane.get()
         if lane >= self._num_lanes:
@@ -398,6 +424,14 @@ def lock_workspace() -> None:
 
     """
     current_workspace_manager().lock()
+
+
+def size_workspace_ubatches_alike() -> None:
+    """Size every DBO microbatch's workspace like the largest one.
+
+    See WorkspaceManager.size_ubatches_alike.
+    """
+    current_workspace_manager().size_ubatches_alike()
 
 
 def unlock_workspace() -> None:
