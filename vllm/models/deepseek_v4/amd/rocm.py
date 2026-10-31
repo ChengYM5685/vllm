@@ -1488,7 +1488,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 inv_rope=prefill_rotated,
             )
         rotated = 0
-        if num_decodes > 0:
+        # A DBO microbatch that lies in the DP padding holds the last request
+        # with no query tokens: a decode with no rows to attend.
+        if num_decodes > 0 and num_decode_tokens > 0:
             fuse_decode_inv_rope = fuse_inv_rope and not on_gfx1250() and not on_rdna()
             rotated = self._forward_decode(
                 q=q[:num_decode_tokens],
