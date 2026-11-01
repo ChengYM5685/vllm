@@ -3,7 +3,7 @@
 """Microbatching (DBO) helpers for the V2 GPU model runner."""
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -352,6 +352,7 @@ class UBatchRunner:
         self.ready_barrier = threading.Barrier(self.num_ubatches + 1)
         self._pending_finish: Callable[[], Any] | None = None
         self.sm_control = create_sm_control_context(self.parallel_config)
+        self._model_streams: list[torch.cuda.Stream] | None = None
 
     def prepare(
         self,
@@ -488,6 +489,11 @@ class UBatchRunner:
         assert len(ubatch_slices) == self.num_ubatches
 
         compute_stream = self.capture_stream if for_capture else current_stream()
+        blas_streams = [compute_stream, self.comm_stream]
+        if for_capture:
+            if self._model_streams is None:
+                self._model_streams = _find_model_streams(model)
+            blas_streams += self._model_streams
         ubatch_contexts = make_ubatch_contexts(
             num_micro_batches=self.num_ubatches,
             comm_stream=self.comm_stream,
@@ -508,7 +514,8 @@ class UBatchRunner:
                 torch.accelerator.set_device_index(self.device.index)
                 if for_capture:
                     # Allocate cuBLAS workspaces before capture.
-                    for stream in (compute_stream, self.comm_stream):
+                    # Include the side streams the model forks GEMMs onto.
+                    for stream in blas_streams:
                         with torch.cuda.stream(stream):
                             torch.cuda.current_blas_handle()
                             if current_platform.is_rocm():
@@ -579,6 +586,24 @@ class UBatchRunner:
             logger.exception("Failed to join microbatch threads after an abort")
         finally:
             self._pending_finish = None
+
+
+def _find_model_streams(model: Any) -> list[torch.cuda.Stream]:
+    """Side streams the model's modules hold, e.g. to overlap work in capture."""
+    streams: dict[int, torch.cuda.Stream] = {}
+    if not isinstance(model, torch.nn.Module):
+        return []
+    for module in model.modules():
+        for value in vars(module).values():
+            values: Iterable[Any] = (value,)
+            if isinstance(value, dict):
+                values = value.values()
+            elif isinstance(value, (list, tuple)):
+                values = value
+            for v in values:
+                if isinstance(v, torch.cuda.Stream):
+                    streams.setdefault(v.cuda_stream, v)
+    return list(streams.values())
 
 
 def maybe_build_ubatch_runner(
