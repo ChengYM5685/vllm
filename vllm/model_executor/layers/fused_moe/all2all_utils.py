@@ -42,6 +42,7 @@ from vllm.utils.import_utils import (
     has_mori,
     has_nixl_ep,
 )
+from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe import QuantFormat
@@ -186,6 +187,25 @@ def maybe_roundup_layer_hidden_size(
         )
 
     return hidden_size
+
+
+def _mori_ubatch_max_tokens(max_num_tokens: int, num_ubatches: int) -> int:
+    """Most tokens a rank's microbatch after the first holds under DBO.
+
+    A split step pads every DP rank to the same count N <= max_num_tokens and
+    cuts it at multiples of N // num_ubatches, or, for a uniform batch of
+    q-token queries (spec decode), at multiples of q * (N // (q * num_ubatches)).
+    Either way a later microbatch holds less than N / num_ubatches +
+    (num_ubatches - 1) * q tokens (q = 1 for the plain cut).
+    """
+    if num_ubatches <= 1:
+        return max_num_tokens
+    spec_config = get_current_vllm_config().speculative_config
+    q = 1
+    if spec_config is not None and spec_config.num_speculative_tokens:
+        q += spec_config.num_speculative_tokens
+    bound = cdiv(max_num_tokens, num_ubatches) + (num_ubatches - 1) * q
+    return min(max_num_tokens, bound)
 
 
 def maybe_make_prepare_finalize(
@@ -357,12 +377,23 @@ def maybe_make_prepare_finalize(
             all_to_all_args.update(
                 async_ll=True, async_ll_transport="sdma", kernel_backend="hip"
             )
-        # Under DBO each microbatch dispatches through its own op.
+        # Under DBO each microbatch dispatches through its own op. Microbatch 0's
+        # op also serves the steps DBO does not split, so it takes the full batch;
+        # the others only ever see their share of a split one.
         from vllm.v1.worker.ubatch_utils import get_num_ubatches
 
         num_ops = get_num_ubatches(parallel_config)
+        ubatch_max_tokens = _mori_ubatch_max_tokens(moe.max_num_tokens, num_ops)
         handles = [
-            all2all_manager.get_handle({**all_to_all_args, "ubatch_id": i})
+            all2all_manager.get_handle(
+                {**all_to_all_args, "ubatch_id": i}
+                if i == 0
+                else {
+                    **all_to_all_args,
+                    "ubatch_id": i,
+                    "max_num_inp_token_per_rank": ubatch_max_tokens,
+                }
+            )
             for i in range(num_ops)
         ]
         prepare_finalize = MoriEPv2PrepareAndFinalize(
