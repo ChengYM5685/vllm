@@ -6118,13 +6118,24 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        # Add `is_profile` here to pre-allocate communication buffers.
+        # Run it unsplit, like the V2 profile run: a step DBO does not split can
+        # carry every DP rank's max_num_tokens, and microbatch 0's workspace
+        # serves it.
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True, randomize_inputs=randomize_inputs
+            self.max_num_tokens,
+            is_profile=True,
+            allow_microbatching=False,
+            randomize_inputs=randomize_inputs,
         )
         if self.parallel_config.use_ubatching:
-            # The profile run does not microbatch, so it sized only microbatch
-            # 0's workspace; size the others alike before capture locks them.
+            # The run above is unsplit, so only microbatch 0 has its workspace and
+            # persistent resources. Run split once to create the other
+            # microbatches' persistent resources, then size their workspaces alike
+            # before capture locks them.
+            self._dummy_run(
+                self.max_num_tokens, is_profile=True, randomize_inputs=randomize_inputs
+            )
             size_workspace_ubatches_alike()
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:

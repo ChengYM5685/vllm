@@ -91,6 +91,7 @@ class UBatchWrapper:
         self.device = device
         self.is_debugging_mode = logger.isEnabledFor(logging.DEBUG)
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
+        self._model_streams: list[torch.cuda.Stream] | None = None
 
     @property
     def graph_pool(self):
@@ -118,6 +119,13 @@ class UBatchWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
+    def _get_model_streams(self, model) -> list[torch.cuda.Stream]:
+        if self._model_streams is None:
+            from vllm.v1.worker.gpu.ubatch_utils import _find_model_streams
+
+            self._model_streams = _find_model_streams(model)
+        return self._model_streams
+
     def _capture_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         """Capture a cudagraph for a microbatched run.
 
@@ -144,10 +152,17 @@ class UBatchWrapper:
         def _capture_ubatch_thread(results, ubatch_metadata):
             torch.accelerator.set_device_index(self.device)
             ubatch_context = ubatch_metadata.context
-            with torch.cuda.stream(ubatch_context.compute_stream):
-                _ = torch.cuda.current_blas_handle()
-            with torch.cuda.stream(ubatch_context.comm_stream):
-                _ = torch.cuda.current_blas_handle()
+            # Create BLAS handles and workspaces before capture, on every stream
+            # the model forks GEMMs onto. On ROCm only a GEMM creates the
+            # per-thread hipBLASLt handle, and creating it in capture fails.
+            dtype = self.vllm_config.model_config.dtype
+            streams = [ubatch_context.compute_stream, ubatch_context.comm_stream]
+            for stream in streams + self._get_model_streams(model):
+                with torch.cuda.stream(stream):
+                    _ = torch.cuda.current_blas_handle()
+                    if current_platform.is_rocm():
+                        x = torch.zeros(1, 1, dtype=dtype, device="cuda")
+                        torch.mm(x, x)
             with ubatch_context:
                 model_output = model(
                     input_ids=ubatch_metadata.input_ids,
