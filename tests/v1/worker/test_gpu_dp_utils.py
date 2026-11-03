@@ -120,11 +120,18 @@ def _sync_ubatching(
     return synced_desc.num_ubatches or 1, synced_desc.cg_mode
 
 
-def test_no_ubatching_when_a_rank_has_an_empty_last_ubatch():
-    # Padded to 600 tokens, rank 1's 100 tokens all land in microbatch 0, so
-    # its microbatch 1 would be pure padding, which faults the forward.
-    assert _sync_ubatching(600, 100)[0] == 1
+def test_ubatching_survives_a_rank_with_an_empty_last_ubatch():
+    # Padded to 600 tokens, rank 1's 100 tokens all land in microbatch 0. Every
+    # rank still splits so the expert all-to-all stays collective.
+    assert _sync_ubatching(600, 100)[0] == 2
     assert _sync_ubatching(600, 500)[0] == 2
+
+
+def test_eager_when_a_rank_exactly_fills_the_earlier_ubatches():
+    # Rank 1's 64 tokens exactly fill microbatch 0 of a 128-token graph, so its
+    # microbatch 1 is pure padding; a captured graph cannot replay that.
+    assert _sync_ubatching(128, 64, 2, 128) == (2, CUDAGraphMode.NONE)
+    assert _sync_ubatching(128, 65, 2, 128) == (2, CUDAGraphMode.FULL)
 
 
 def test_eager_when_graph_padding_empties_a_last_ubatch():
