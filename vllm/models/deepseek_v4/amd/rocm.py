@@ -1899,10 +1899,17 @@ class DeepseekV4RocmMxfp4Compressor(DeepseekCompressor):
         attn_metadata: dict[str, Any],
         pdl_kwargs: dict,
     ) -> None:
-        num_tokens = state_metadata.slot_mapping.shape[0]
+        k_cache_metadata = attn_metadata[self.k_cache_prefix]
+        # The state slot mapping spans the DP-padded batch, but the K cache slot
+        # mapping and token_to_req_indices cover only the real tokens, and the
+        # pooling kernel reads both per token. Launch over the real tokens only:
+        # a DBO microbatch of pure DP padding has none, and its empty tensors
+        # would fault.
+        num_tokens = min(
+            state_metadata.slot_mapping.shape[0], k_cache_metadata.slot_mapping.shape[0]
+        )
         if num_tokens == 0:
             return
-        k_cache_metadata = attn_metadata[self.k_cache_prefix]
         kv_slot_mapping = k_cache_metadata.slot_mapping[:num_tokens]
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
         pooled_k = self._pooled_k(num_tokens)
