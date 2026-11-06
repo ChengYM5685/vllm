@@ -303,7 +303,12 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
                 require_uniform=True,
             )
         )
-        assert num_decodes + num_prefills == num_reqs
+        if num_tokens == 0:
+            # A DBO microbatch lying wholly in the DP padding holds the last
+            # request with no query tokens, which the split counts as a decode.
+            num_decodes = num_prefills = 0
+        else:
+            assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
 
         prefill_metadata: MiniMaxM3SparsePrefillMetadata | None = None
