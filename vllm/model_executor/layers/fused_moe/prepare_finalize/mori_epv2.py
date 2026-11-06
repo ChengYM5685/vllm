@@ -20,6 +20,18 @@ logger = init_logger(__name__)
 _RECV_ROW_ALIGN = 32
 
 
+def _quantizes_per_tensor(quant_config: FusedMoEQuantConfig) -> bool:
+    """Whether the activations take one quantization scale for the whole tensor.
+
+    OCP MX (and NVFP4) configs carry a per-tensor group shape, but their dtype
+    is a string and they scale each 1x32 (1x16) block of a row, so the experts
+    can quantize the received rows themselves.
+    """
+    return quant_config.is_per_tensor and isinstance(
+        quant_config.quant_dtype, torch.dtype
+    )
+
+
 class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def __init__(
         self,
@@ -64,7 +76,7 @@ class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "VLLM_MORI_EP_V2=0 for MORI EPv1, which also requires AITER fused MoE."
             )
 
-        if quant_dtype is not None and fused_experts.quant_config.is_per_tensor:
+        if _quantizes_per_tensor(fused_experts.quant_config):
             raise ValueError(
                 "MORI EPv2 does not support per-tensor activation quantization: "
                 "the experts would quantize the received rows, which AITER's "
@@ -207,7 +219,7 @@ class MoriEPv2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # Experts that read only the received rows can skip clearing the rest,
         # unless a dynamic per-tensor activation scale is taken over every row.
         if not self._experts_read_recv_rows_only or (
-            quant_config.is_per_tensor and quant_config.a1_scale is None
+            _quantizes_per_tensor(quant_config) and quant_config.a1_scale is None
         ):
             dispatch_a1.masked_fill_(unused, 0)
         dispatch_weights.masked_fill_(unused, 0)

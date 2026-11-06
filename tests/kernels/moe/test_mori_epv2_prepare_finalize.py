@@ -15,6 +15,10 @@ import torch.multiprocessing as mp
 import vllm.model_executor.layers.fused_moe.prepare_finalize.mori_epv2 as mori_epv2
 import vllm.utils.import_utils as import_utils
 from vllm.config.parallel import resolve_mori_all2all
+from vllm.model_executor.layers.fused_moe.config import (
+    fp8_w8a8_moe_quant_config,
+    ocp_mx_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize.mori_epv2 import (
     MoriEPv2PrepareAndFinalize,
 )
@@ -299,6 +303,28 @@ def test_experts_it_cannot_feed_are_rejected(
         prepare_finalize.post_init_setup(experts)
     else:
         with pytest.raises(ValueError, match="VLLM_MORI_EP_V2=0"):
+            prepare_finalize.post_init_setup(experts)
+
+
+@pytest.mark.parametrize("quant_dtype,ok", [("mxfp4", True), ("fp8", False)])
+def test_block_scaled_mx_activations_are_not_per_tensor(quant_dtype, ok):
+    # OCP MX configs carry a per-tensor group shape, but the experts scale each
+    # 1x32 block of a received row. Only per-tensor FP8 is refused.
+    if quant_dtype == "mxfp4":
+        quant_config = ocp_mx_moe_quant_config("mxfp4", w1_scale=None, w2_scale=None)
+    else:
+        quant_config = fp8_w8a8_moe_quant_config(w1_scale=None, w2_scale=None)
+    assert quant_config.is_per_tensor
+    experts = SimpleNamespace(
+        moe_config=SimpleNamespace(in_dtype=torch.bfloat16),
+        quant_config=quant_config,
+        expects_unquantized_inputs=True,
+    )
+    prepare_finalize = _make_pf(FakeOp(16))
+    if ok:
+        prepare_finalize.post_init_setup(experts)
+    else:
+        with pytest.raises(ValueError, match="per-tensor"):
             prepare_finalize.post_init_setup(experts)
 
 
