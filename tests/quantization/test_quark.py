@@ -1434,6 +1434,31 @@ def test_quark_w8a8_fp8_moe_per_block_rejects_misaligned_partition():
         )
 
 
+@pytest.mark.parametrize("method_cls", [QuarkOCP_MX_MoEMethod, QuarkW8A8Int8MoEMethod])
+def test_quark_moe_apply_passes_shared_experts_to_kernel(method_cls):
+    # When the prepare/finalize overlaps the shared experts with its combine
+    # (supports_async), the MoE runner leaves them to the modular kernel, which
+    # gets them only through apply.
+    method = object.__new__(method_cls)
+    method.moe_kernel = MagicMock()
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(0),
+        w2_weight=torch.empty(0),
+        activation=MoEActivation.SILU,
+        global_num_experts=8,
+        apply_router_weight_on_input=False,
+        expert_map=None,
+    )
+    shared_experts = Mock()
+    x = torch.zeros(2, 4)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
+    method.apply(layer, x, torch.ones(2, 1), topk_ids, shared_experts, x)
+
+    kwargs = method.moe_kernel.apply.call_args.kwargs
+    assert kwargs["shared_experts"] is shared_experts
+    assert kwargs["shared_experts_input"] is x
+
+
 def test_quark_fp8_ptpc_exposes_kernel_input_quant_key(monkeypatch):
     """QuarkW8A8Fp8 must advertise the key its kernel consumes pre-quantized.
 
