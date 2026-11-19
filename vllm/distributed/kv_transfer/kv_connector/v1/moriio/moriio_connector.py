@@ -82,6 +82,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     get_layer_head_layout,
     get_layer_transfer_geometry,
     get_mamba_state_layout,
+    get_nvfp4_page_split,
     is_mla_cache_layer,
     iter_layer_registration_regions,
     kda_conv_ssm,
@@ -289,6 +290,29 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:
         return False
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
+        """Prefer a head-major block layout (LBHNC) for non-MLA models.
+
+        With heterogeneous TP (e.g. a TP4 producer feeding a TP1 consumer) each
+        producer rank writes only its own KV heads into the consumer's blocks.
+        In a token-major layout (LBNHC) those heads are interleaved per token,
+        so one block needs block_size RDMA writes of a single head slice each
+        instead of one contiguous write, and long prompts exceed the QP send
+        queue depth ("SQ full"). Same choice as NixlConnector, including its
+        MLA rule: an MLA cache has one latent head replicated on every rank, so
+        the layout does not matter there.
+        """
+        if vllm_config.model_config is None:
+            return None
+        if vllm_config.model_config.use_mla:
+            return None
+        logger.info_once(
+            "MoRIIOConnector setting KV cache layout to LBHNC (head-major blocks: "
+            "one RDMA write per block per head slice)."
+        )
+        return "LBHNC"
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
@@ -3647,12 +3671,18 @@ class MoRIIOConnectorWorker:
         self, remote_tp_size: int | None, layer_name: str | None = None
     ) -> MoRIIOWriteTPMapping:
         """Decode ranks this prefill rank writes, and what each receives."""
+        # An MLA-style cache in a non-MLA model (e.g. MiniMax-M3's indexer
+        # keys) has no KV heads: it is identical on every TP rank, so it is
+        # copied whole like an MLA latent rather than sliced by head.
+        is_mla = self.use_mla or (
+            layer_name is not None and self._is_mla_cache_layer(layer_name)
+        )
         return compute_write_tp_mapping(
             self.tp_rank,
             self.world_size,
             remote_tp_size or self.world_size,
-            1 if self.use_mla else self._layer_total_num_kv_heads(layer_name),
-            self.use_mla,
+            1 if is_mla else self._layer_total_num_kv_heads(layer_name),
+            is_mla,
             self._has_mamba,
         )
 
@@ -3943,6 +3973,8 @@ class MoRIIOConnectorWorker:
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
             ),
+            # A packed NVFP4 page's head slots are not per-head rows.
+            nvfp4_split=get_nvfp4_page_split(self.layer_to_spec.get(layer_name)),
         )
         return self._apply_layer_mr_offsets(
             layer_name, offsets, remote_moriio_meta, remote_engine_id
